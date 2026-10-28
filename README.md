@@ -84,10 +84,17 @@ select a different label column.
 The combined CSV and PNG file names can be set together with `--name`; both
 are saved under `results/` by default. For example,
 `python evaluate_all_models.py --name bank_results` creates
-`results/bank_results.csv` and `results/bank_results.png`. If the name ends in
-`.csv` or `.png`, that extension is removed before generating both files.
-Use `--output` or `--plot` to override either output path individually. Missing
-output directories are created automatically.
+`results/bank_results.csv` and `results/bank_results.png`. When evaluating a
+custom CSV URL, `--name` also replaces the `custom` dataset label shown in the
+CSV and chart; without it, that label remains `custom`. For example:
+
+```bash
+python evaluate_all_models.py --data-url "https://example.com/bank.csv" --no-target --n-clusters 3 --name bank
+```
+
+If the name ends in `.csv` or `.png`, that extension is removed before
+generating both files. Use `--output` or `--plot` to override either output
+path individually. Missing output directories are created automatically.
 
 
 ## Notes
