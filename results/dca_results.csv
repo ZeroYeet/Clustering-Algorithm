@@ -1,2 +1,0 @@
-dataset,samples,features,clusters,accuracy_percent,precision_macro_percent,recall_macro_percent,f1_macro_percent,ari,nmi,noise_points,runtime_seconds,iterations
-custom,400,4,2,51.74999999999999,52.03581432573029,52.214905716851234,50.88777347303599,-0.0011118585282941249,0.001342093652090653,0,0.013202299989643507,23

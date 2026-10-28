@@ -11,10 +11,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import (
-    adjusted_rand_score,
     accuracy_score,
-    normalized_mutual_info_score,
     precision_recall_fscore_support,
+    silhouette_score,
 )
 
 from benchmark_data import (
@@ -30,17 +29,27 @@ METRIC_FIELDS = (
     "samples",
     "features",
     "clusters",
+    "silhouette_score",
     "accuracy_percent",
     "precision_macro_percent",
     "recall_macro_percent",
     "f1_macro_percent",
-    "ari",
-    "nmi",
     "noise_points",
     "runtime_seconds",
     "iterations",
 )
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+SILHOUETTE_SAMPLE_SIZE = 2000
+
+
+def score_axis_limits(metric_values: np.ndarray) -> tuple[float, float]:
+    finite_values = metric_values[np.isfinite(metric_values)]
+    if finite_values.size == 0:
+        return 0.0, 100.0
+    minimum = float(finite_values.min())
+    maximum = max(100.0, float(finite_values.max()))
+    lower_bound = min(0.0, minimum - max(abs(minimum) * 0.05, 1.0))
+    return lower_bound, maximum + 5.0
 
 
 def evaluate_dataset(
@@ -49,6 +58,8 @@ def evaluate_dataset(
     dataset_url: str | None = None,
     target_column: str | None = None,
     has_header: bool | None = None,
+    include_target: bool = True,
+    n_clusters: int | None = None,
     beta: float = 0.05,
     theta: float = 0.5,
     max_iter: int = 300,
@@ -56,14 +67,17 @@ def evaluate_dataset(
     random_state: int = 42,
 ) -> dict[str, Any]:
     """Fit MW-K-means on a benchmark dataset and return clustering metrics."""
-    features, true_labels = load_benchmark_data(
-        dataset_name,
-        url=dataset_url,
-        target_column=target_column,
-        has_header=has_header,
-    )
+    load_options: dict[str, Any] = {
+        "url": dataset_url,
+        "target_column": target_column,
+        "has_header": has_header,
+    }
+    if not include_target:
+        load_options["include_target"] = False
+    features, true_labels = load_benchmark_data(dataset_name, **load_options)
+    n_clusters = resolve_cluster_count(true_labels, n_clusters)
     model = MWKMeans(
-        n_clusters=len(np.unique(true_labels)),
+        n_clusters=n_clusters,
         beta=beta,
         theta=theta,
         max_iter=max_iter,
@@ -72,7 +86,6 @@ def evaluate_dataset(
         random_state=random_state,
     )
 
-    model.fit(features)
     start = time.perf_counter()
     predicted_clusters = model.fit_predict(features)
     runtime_seconds = time.perf_counter() - start
@@ -81,6 +94,7 @@ def evaluate_dataset(
         dataset_name,
         true_labels,
         predicted_clusters,
+        features=features,
         n_features=features.shape[1],
         n_clusters=model.n_clusters,
         runtime_seconds=runtime_seconds,
@@ -90,17 +104,56 @@ def evaluate_dataset(
 
 def score_clustering(
     dataset_name: str,
-    true_labels: np.ndarray,
+    true_labels: np.ndarray | None,
     predicted_clusters: np.ndarray,
     *,
+    features: np.ndarray,
     n_features: int,
     n_clusters: int,
     runtime_seconds: float,
     iterations: int,
 ) -> dict[str, Any]:
     """Calculate the shared evaluation metrics for a clustering result."""
+    cluster_ids = np.unique(predicted_clusters)
+    silhouette = None
+    if 2 <= len(cluster_ids) < len(features):
+        sample_size = (
+            SILHOUETTE_SAMPLE_SIZE
+            if features.shape[0] > SILHOUETTE_SAMPLE_SIZE
+            else None
+        )
+        silhouette = float(
+            silhouette_score(
+                features,
+                predicted_clusters,
+                sample_size=sample_size,
+                random_state=42 if sample_size is not None else None,
+            )
+        )
+
+    result: dict[str, Any] = {
+        "dataset": dataset_name,
+        "samples": int(features.shape[0]),
+        "features": int(n_features),
+        "clusters": int(len(cluster_ids)),
+        "silhouette_score": silhouette,
+        "noise_points": int(np.count_nonzero(predicted_clusters == -1)),
+        "runtime_seconds": runtime_seconds,
+        "iterations": int(iterations),
+    }
+    if true_labels is None:
+        result.update(
+            {
+                "accuracy_percent": None,
+                "precision_macro_percent": None,
+                "recall_macro_percent": None,
+                "f1_macro_percent": None,
+            }
+        )
+        return result
+
     true_classes, encoded_targets = np.unique(true_labels, return_inverse=True)
-    cluster_ids, encoded_clusters = np.unique(predicted_clusters, return_inverse=True)
+    _, encoded_clusters = np.unique(predicted_clusters, return_inverse=True)
     contingency = np.zeros((len(true_classes), len(cluster_ids)), dtype=np.int64)
     np.add.at(contingency, (encoded_targets, encoded_clusters), 1)
     class_indices, cluster_indices = linear_sum_assignment(-contingency)
@@ -122,26 +175,31 @@ def score_clustering(
         average="macro",
         zero_division=0,
     )
+    result.update(
+        {
+            "accuracy_percent": 100.0
+            * accuracy_score(encoded_targets, aligned_predictions),
+            "precision_macro_percent": 100.0 * precision,
+            "recall_macro_percent": 100.0 * recall,
+            "f1_macro_percent": 100.0 * f1,
+        }
+    )
+    return result
 
-    return {
-        "dataset": dataset_name,
-        "samples": int(true_labels.shape[0]),
-        "features": int(n_features),
-        "clusters": int(n_clusters),
-        "accuracy_percent": 100.0 * accuracy_score(
-            encoded_targets, aligned_predictions
-        ),
-        "precision_macro_percent": 100.0 * precision,
-        "recall_macro_percent": 100.0 * recall,
-        "f1_macro_percent": 100.0 * f1,
-        "ari": float(adjusted_rand_score(true_labels, predicted_clusters)),
-        "nmi": float(
-            normalized_mutual_info_score(true_labels, predicted_clusters)
-        ),
-        "noise_points": int(np.count_nonzero(predicted_clusters == -1)),
-        "runtime_seconds": runtime_seconds,
-        "iterations": int(iterations),
-    }
+
+def resolve_cluster_count(
+    true_labels: np.ndarray | None,
+    n_clusters: int | None,
+) -> int:
+    if n_clusters is not None:
+        if n_clusters < 2:
+            raise ValueError("n_clusters must be at least 2")
+        return n_clusters
+    if true_labels is None:
+        raise ValueError(
+            "n_clusters must be provided when evaluating data without target labels"
+        )
+    return int(np.unique(true_labels).size)
 
 
 def print_results(results: list[dict[str, Any]]) -> None:
@@ -151,12 +209,11 @@ def print_results(results: list[dict[str, Any]]) -> None:
         ("samples", "Samples"),
         ("features", "Features"),
         ("clusters", "Clusters"),
+        ("silhouette_score", "Silhouette"),
         ("accuracy_percent", "Accuracy %"),
         ("precision_macro_percent", "Precision %"),
         ("recall_macro_percent", "Recall %"),
         ("f1_macro_percent", "F1 %"),
-        ("ari", "ARI"),
-        ("nmi", "NMI"),
         ("noise_points", "Noise"),
         ("runtime_seconds", "Time (s)"),
         ("iterations", "Iterations"),
@@ -166,9 +223,19 @@ def print_results(results: list[dict[str, Any]]) -> None:
         rows.append(
             [
                 result[key]
-                if key in {"dataset", "samples", "features", "clusters", "noise_points", "iterations"}
+                if key
+                in {
+                    "dataset",
+                    "samples",
+                    "features",
+                    "clusters",
+                    "noise_points",
+                    "iterations",
+                }
+                else "N/A"
+                if result[key] is None
                 else f"{result[key]:.4f}"
-                if key in {"ari", "nmi", "runtime_seconds"}
+                if key in {"silhouette_score", "runtime_seconds"}
                 else f"{result[key]:.2f}"
                 for key, _ in headers
             ]
@@ -206,33 +273,35 @@ def save_plot(
 
     datasets = [result["dataset"] for result in results]
     metric_names = (
+        "Silhouette x100",
         "Accuracy",
         "Precision",
         "Recall",
         "F1",
-        "ARI x100",
-        "NMI x100",
     )
     metric_fields = (
+        "silhouette_score",
         "accuracy_percent",
         "precision_macro_percent",
         "recall_macro_percent",
         "f1_macro_percent",
-        "ari",
-        "nmi",
     )
     metric_values = np.asarray(
-        [[result[field] for field in metric_fields] for result in results],
-        dtype=float,
+        [
+            [
+                np.nan if result[field] is None else float(result[field])
+                for field in metric_fields
+            ]
+            for result in results
+        ]
     )
-    metric_values[:, 4:] *= 100
-
+    metric_values[:, 0] *= 100
     figure, (metrics_axis, runtime_axis) = plt.subplots(
         2, 1, figsize=(max(9, 2.3 * len(results)), 8)
     )
     figure.suptitle(title, fontsize=15)
     x_positions = np.arange(len(results))
-    bar_width = 0.12
+    bar_width = 0.11
     for metric_index, metric_name in enumerate(metric_names):
         offset = (metric_index - (len(metric_names) - 1) / 2) * bar_width
         bars = metrics_axis.bar(
@@ -241,16 +310,16 @@ def save_plot(
             bar_width,
             label=metric_name,
         )
-        metrics_axis.bar_label(bars, fmt="%.1f", fontsize=7, padding=2)
+        labels = [
+            f"{height:.1f}" if np.isfinite(height) else ""
+            for height in metric_values[:, metric_index]
+        ]
+        metrics_axis.bar_label(bars, labels=labels, fontsize=6, padding=2)
 
-    metrics_axis.set_ylabel("Score (%)")
-    metrics_axis.set_ylim(0, 115)
+    metrics_axis.set_ylabel("Score (%) / normalized score x100")
+    metrics_axis.set_ylim(*score_axis_limits(metric_values))
     metrics_axis.set_xticks(x_positions, datasets)
-    metrics_axis.legend(
-        ncols=3,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.13),
-    )
+    metrics_axis.legend(ncols=4, loc="lower center", bbox_to_anchor=(0.5, 1.01))
     metrics_axis.grid(axis="y", linestyle=":", alpha=0.5)
 
     runtimes = [result["runtime_seconds"] for result in results]
@@ -284,11 +353,23 @@ def main() -> None:
     )
     dataset_group.add_argument(
         "--dataset-url",
+        "--data-url",
+        dest="dataset_url",
         help="Direct HTTP(S) URL to a tabular CSV dataset.",
     )
     parser.add_argument(
         "--target-column",
         help="Target column name or zero-based index (default: last column).",
+    )
+    parser.add_argument(
+        "--no-target",
+        action="store_true",
+        help="Treat every CSV column as a feature and evaluate with Silhouette only.",
+    )
+    parser.add_argument(
+        "--n-clusters",
+        type=int,
+        help="Cluster count; required with --no-target, otherwise inferred from labels.",
     )
     parser.add_argument(
         "--no-header",
@@ -317,8 +398,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.dataset_url and (args.target_column is not None or args.no_header):
-        parser.error("--target-column and --no-header require --dataset-url")
+    if not args.dataset_url and (
+        args.target_column is not None or args.no_header or args.no_target
+    ):
+        parser.error("--target-column, --no-header, and --no-target require --dataset-url")
+    if args.no_target and args.target_column is not None:
+        parser.error("--target-column cannot be used with --no-target")
+    if args.no_target and args.n_clusters is None:
+        parser.error("--n-clusters is required with --no-target")
 
     if args.dataset_url:
         results = [
@@ -327,6 +414,8 @@ def main() -> None:
                 dataset_url=args.dataset_url,
                 target_column=args.target_column,
                 has_header=False if args.no_header else None,
+                include_target=not args.no_target,
+                n_clusters=args.n_clusters,
                 beta=args.beta,
                 theta=args.theta,
                 max_iter=args.max_iter,
@@ -339,6 +428,7 @@ def main() -> None:
         results = [
             evaluate_dataset(
                 name,
+                n_clusters=args.n_clusters,
                 beta=args.beta,
                 theta=args.theta,
                 max_iter=args.max_iter,

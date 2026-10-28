@@ -18,14 +18,21 @@ from benchmark_data import (
     load_benchmark_data,
 )
 from model.dca import ip_dca
-from model.evaluate_mw_kmeans import RESULTS_DIR, METRIC_FIELDS, score_clustering
+from model.evaluate_mw_kmeans import (
+    METRIC_FIELDS,
+    RESULTS_DIR,
+    resolve_cluster_count,
+    score_axis_limits,
+    score_clustering,
+)
+from model.gk_rdca import GKRDCA
 from model.kmeans import kmeans
 from model.mw_kmeans import MWKMeans
 
 
 ALL_MODEL_FIELDS = (
     "model",
-    *(field for field in METRIC_FIELDS if field not in {"ari", "nmi"}),
+    *METRIC_FIELDS,
 )
 
 
@@ -35,23 +42,29 @@ def evaluate_dataset(
     dataset_url: str | None = None,
     target_column: str | None = None,
     has_header: bool | None = None,
+    include_target: bool = True,
+    n_clusters: int | None = None,
     beta: float = 0.05,
     theta: float = 0.5,
     n_init: int = 10,
     max_iter: int = 300,
     dca_t: float = 10.0,
     dca_max_iter: int = 1000,
+    gk_sigma: float = 1.0,
+    gk_tau: float = 0.1,
     tol: float = 1e-6,
     random_state: int = 42,
 ) -> list[dict[str, Any]]:
-    """Evaluate all three project clustering models on one loaded dataset."""
-    features, true_labels = load_benchmark_data(
-        dataset_name,
-        url=dataset_url,
-        target_column=target_column,
-        has_header=has_header,
-    )
-    n_clusters = len(np.unique(true_labels))
+    """Evaluate every project clustering model on one loaded dataset."""
+    load_options: dict[str, Any] = {
+        "url": dataset_url,
+        "target_column": target_column,
+        "has_header": has_header,
+    }
+    if not include_target:
+        load_options["include_target"] = False
+    features, true_labels = load_benchmark_data(dataset_name, **load_options)
+    n_clusters = resolve_cluster_count(true_labels, n_clusters)
     results: list[dict[str, Any]] = []
 
     mw_model = MWKMeans(
@@ -63,7 +76,6 @@ def evaluate_dataset(
         n_init=n_init,
         random_state=random_state,
     )
-    mw_model.fit(features)
     start = time.perf_counter()
     mw_labels = mw_model.fit_predict(features)
     mw_runtime = time.perf_counter() - start
@@ -74,7 +86,6 @@ def evaluate_dataset(
             true_labels,
             mw_labels,
             features,
-            n_clusters,
             mw_runtime,
             mw_model.n_iter_,
         )
@@ -103,7 +114,6 @@ def evaluate_dataset(
             true_labels,
             best_kmeans["labels"],
             features,
-            n_clusters,
             kmeans_runtime,
             best_kmeans["iterations"],
         )
@@ -117,6 +127,7 @@ def evaluate_dataset(
         max_iter=dca_max_iter,
         tol=tol,
         random_state=random_state,
+        n_init=n_init,
     )
     dca_runtime = time.perf_counter() - start
     results.append(
@@ -126,9 +137,32 @@ def evaluate_dataset(
             true_labels,
             dca_result["labels"],
             features,
-            n_clusters,
             dca_runtime,
             dca_result["iterations"],
+        )
+    )
+
+    gk_model = GKRDCA(
+        n_clusters=n_clusters,
+        sigma=gk_sigma,
+        tau=gk_tau,
+        max_iter=max_iter,
+        tol=tol,
+        n_init=n_init,
+        random_state=random_state,
+    )
+    start = time.perf_counter()
+    gk_labels = gk_model.fit_predict(features)
+    gk_runtime = time.perf_counter() - start
+    results.append(
+        _score_model(
+            "GK-RDCA",
+            dataset_name,
+            true_labels,
+            gk_labels,
+            features,
+            gk_runtime,
+            gk_model.n_iter_,
         )
     )
     return results
@@ -137,10 +171,9 @@ def evaluate_dataset(
 def _score_model(
     model_name: str,
     dataset_name: str,
-    true_labels: np.ndarray,
+    true_labels: np.ndarray | None,
     predicted_labels: np.ndarray,
     features: np.ndarray,
-    n_clusters: int,
     runtime_seconds: float,
     iterations: int,
 ) -> dict[str, Any]:
@@ -148,8 +181,9 @@ def _score_model(
         dataset_name,
         true_labels,
         predicted_labels,
+        features=features,
         n_features=features.shape[1],
-        n_clusters=n_clusters,
+        n_clusters=len(np.unique(predicted_labels)),
         runtime_seconds=runtime_seconds,
         iterations=iterations,
     )
@@ -172,45 +206,77 @@ def save_combined_csv(
         )
 
 
+def resolve_output_paths(
+    name: str,
+    output: Path | None,
+    plot: Path | None,
+) -> tuple[Path, Path]:
+    base_name = Path(name)
+    if base_name.suffix.casefold() in {".csv", ".png"}:
+        base_name = base_name.with_suffix("")
+    if not base_name.name:
+        raise ValueError("--name must contain a file name")
+
+    csv_path = output if output is not None else RESULTS_DIR / f"{base_name}.csv"
+    plot_path = plot if plot is not None else RESULTS_DIR / f"{base_name}.png"
+    return csv_path, plot_path
+
+
 def save_combined_plot(
     results: list[dict[str, Any]],
     output_path: str | Path,
 ) -> None:
-    """Save model metric and runtime comparisons as a PNG chart."""
+    """Save supervised metrics, Silhouette, and runtime comparisons as a PNG."""
     if not results:
         raise ValueError("At least one model result is required to create a plot")
 
     names = [f"{row['dataset']}\n{row['model']}" for row in results]
+    positions = np.arange(len(results))
+
+    figure, (metrics_axis, runtime_axis) = plt.subplots(
+        2,
+        1,
+        figsize=(max(12, 1.8 * len(results)), 8),
+        gridspec_kw={"height_ratios": [2, 1]},
+    )
+    metric_names = ("Silhouette x100", "Accuracy", "Precision", "Recall", "F1")
     metric_fields = (
+        "silhouette_score",
         "accuracy_percent",
         "precision_macro_percent",
         "recall_macro_percent",
         "f1_macro_percent",
     )
-    metric_names = ("Accuracy", "Precision", "Recall", "F1")
-    positions = np.arange(len(results))
-    width = 0.18
-
-    figure, (metrics_axis, runtime_axis) = plt.subplots(
-        2,
-        1,
-        figsize=(max(10, 1.4 * len(results)), 8),
-        gridspec_kw={"height_ratios": [2, 1]},
+    metric_values = np.asarray(
+        [
+            [
+                np.nan if row[field] is None else float(row[field])
+                for field in metric_fields
+            ]
+            for row in results
+        ]
     )
+    metric_values[:, 0] *= 100
     figure.suptitle("Clustering model comparison", fontsize=15)
-    for index, (field, label) in enumerate(zip(metric_fields, metric_names)):
-        values = [row[field] for row in results]
+    bar_width = 0.1
+    bar_spacing = 0.14
+    for metric_index, metric_name in enumerate(metric_names):
+        offset = (metric_index - (len(metric_names) - 1) / 2) * bar_spacing
         bars = metrics_axis.bar(
-            positions + (index - 1.5) * width,
-            values,
-            width,
-            label=label,
+            positions + offset,
+            metric_values[:, metric_index],
+            bar_width,
+            label=metric_name,
         )
-        metrics_axis.bar_label(bars, fmt="%.1f", fontsize=7, padding=2)
+        labels = [
+            f"{height:.1f}" if np.isfinite(height) else ""
+            for height in metric_values[:, metric_index]
+        ]
+        metrics_axis.bar_label(bars, labels=labels, fontsize=6, padding=2)
 
-    metrics_axis.set_ylabel("Score (%)")
-    metrics_axis.set_ylim(0, 115)
-    metrics_axis.set_xticks(positions, names, rotation=30, ha="right")
+    metrics_axis.set_ylabel("Score (%) / normalized score x100")
+    metrics_axis.set_ylim(*score_axis_limits(metric_values))
+    metrics_axis.set_xticks(positions, names, rotation=0, ha="center")
     metrics_axis.legend(ncols=4, loc="lower center", bbox_to_anchor=(0.5, 1.01))
     metrics_axis.grid(axis="y", linestyle=":", alpha=0.5)
 
@@ -219,7 +285,7 @@ def save_combined_plot(
     runtime_axis.bar_label(runtime_bars, fmt="%.4f", fontsize=7, padding=2)
     runtime_axis.set_ylabel("Seconds")
     runtime_axis.set_title("Execution time")
-    runtime_axis.set_xticks(positions, names, rotation=30, ha="right")
+    runtime_axis.set_xticks(positions, names, rotation=0, ha="center")
     runtime_axis.set_ylim(0, max(runtimes, default=0.0) * 1.2 or 1.0)
     runtime_axis.grid(axis="y", linestyle=":", alpha=0.5)
 
@@ -232,7 +298,7 @@ def save_combined_plot(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare MW-K-means, K-means, and DCA in one CSV file."
+        description="Compare MW-K-means, K-means, DCA, and GK-RDCA."
     )
     dataset_group = parser.add_mutually_exclusive_group()
     dataset_group.add_argument(
@@ -243,11 +309,23 @@ def main() -> None:
     )
     dataset_group.add_argument(
         "--dataset-url",
+        "--data-url",
+        dest="dataset_url",
         help="Direct HTTP(S) URL to a tabular CSV dataset.",
     )
     parser.add_argument(
         "--target-column",
         help="Target column name or zero-based index (default: last column).",
+    )
+    parser.add_argument(
+        "--no-target",
+        action="store_true",
+        help="Treat every CSV column as a feature and evaluate with Silhouette only.",
+    )
+    parser.add_argument(
+        "--n-clusters",
+        type=int,
+        help="Cluster count; required with --no-target, otherwise inferred from labels.",
     )
     parser.add_argument(
         "--no-header",
@@ -260,26 +338,38 @@ def main() -> None:
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--dca-t", type=float, default=10.0)
     parser.add_argument("--dca-max-iter", type=int, default=1000)
+    parser.add_argument("--gk-sigma", type=float, default=1.0)
+    parser.add_argument("--gk-tau", type=float, default=0.1)
     parser.add_argument("--tol", type=float, default=1e-6)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument(
+        "--name",
+        type=str,
+        default="all_models_results",
+        help="Base name for both CSV and PNG files in the results directory.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
-        default=RESULTS_DIR / "all_models_results.csv",
-        help="Combined CSV output path.",
+        help="Explicit CSV output path; overrides --name.",
     )
     parser.add_argument(
         "--plot",
         type=Path,
-        default=RESULTS_DIR / "all_models_results.png",
-        help="Combined comparison chart output path.",
+        help="Explicit comparison chart output path; overrides the --name-derived path.",
     )
     args = parser.parse_args()
 
     if args.n_init <= 0:
         parser.error("--n-init must be positive")
-    if not args.dataset_url and (args.target_column is not None or args.no_header):
-        parser.error("--target-column and --no-header require --dataset-url")
+    if not args.dataset_url and (
+        args.target_column is not None or args.no_header or args.no_target
+    ):
+        parser.error("--target-column, --no-header, and --no-target require --dataset-url")
+    if args.no_target and args.target_column is not None:
+        parser.error("--target-column cannot be used with --no-target")
+    if args.no_target and args.n_clusters is None:
+        parser.error("--n-clusters is required with --no-target")
 
     if args.dataset_url:
         dataset_names = ("custom",)
@@ -293,28 +383,55 @@ def main() -> None:
             dataset_url=args.dataset_url,
             target_column=args.target_column,
             has_header=False if args.no_header else None,
+            include_target=not args.no_target,
+            n_clusters=args.n_clusters,
             beta=args.beta,
             theta=args.theta,
             n_init=args.n_init,
             max_iter=args.max_iter,
             dca_t=args.dca_t,
             dca_max_iter=args.dca_max_iter,
+            gk_sigma=args.gk_sigma,
+            gk_tau=args.gk_tau,
             tol=args.tol,
             random_state=args.random_state,
         )
     ]
-    save_combined_csv(results, args.output)
-    save_combined_plot(results, args.plot)
-    print(f"Saved {len(results)} model results to: {args.output}")
-    print(f"Saved comparison chart to: {args.plot}")
-    print("Dataset | Model | Accuracy % | Precision % | Recall % | F1 % | Time (s) | Iterations")
+    try:
+        output_path, plot_path = resolve_output_paths(
+            args.name,
+            args.output,
+            args.plot,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    save_combined_csv(results, output_path)
+    save_combined_plot(results, plot_path)
+    print(f"Saved {len(results)} model results to: {output_path}")
+    print(f"Saved comparison chart to: {plot_path}")
+    print(
+        "Dataset | Model | Silhouette | Accuracy % | Precision % | Recall % | "
+        "F1 % | Time (s) | Iterations"
+    )
     for result in results:
+        metric_output = [
+            "N/A" if result[field] is None else f"{result[field]:.2f}"
+            for field in (
+                "accuracy_percent",
+                "precision_macro_percent",
+                "recall_macro_percent",
+                "f1_macro_percent",
+            )
+        ]
+        silhouette = (
+            "N/A"
+            if result["silhouette_score"] is None
+            else f"{result['silhouette_score']:.4f}"
+        )
         print(
             f"{result['dataset']} | {result['model']} | "
-            f"{result['accuracy_percent']:.2f} | "
-            f"{result['precision_macro_percent']:.2f} | "
-            f"{result['recall_macro_percent']:.2f} | "
-            f"{result['f1_macro_percent']:.2f} | "
+            f"{silhouette} | "
+            f"{' | '.join(metric_output)} | "
             f"{result['runtime_seconds']:.4f} | "
             f"{result['iterations']}"
         )

@@ -46,16 +46,21 @@ def load_benchmark_data(
     url: str | None = None,
     target_column: str | None = None,
     has_header: bool | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Load and scale a built-in, OpenML, or URL-provided CSV dataset."""
+    include_target: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Load a dataset, optionally returning its target labels."""
     if url is not None:
         return _load_csv_from_url(
             url,
             target_column=target_column,
             has_header=has_header,
+            include_target=include_target,
         )
-    if target_column is not None or has_header is not None:
-        raise ValueError("CSV column options can only be used with a dataset URL")
+    if target_column is not None or has_header is not None or not include_target:
+        if target_column is not None or has_header is not None:
+            raise ValueError("CSV column options can only be used with a dataset URL")
+        if not include_target:
+            raise ValueError("--no-target can only be used with a dataset URL")
     if dataset_name is None:
         raise ValueError("Provide either a dataset name or a CSV URL")
 
@@ -76,7 +81,10 @@ def load_benchmark_data(
             raise ValueError("OpenML dataset 181 (yeast) has invalid target labels")
         if not np.isfinite(raw_features).all():
             raise ValueError("OpenML dataset 181 (yeast) contains non-finite values")
-        return MinMaxScaler().fit_transform(raw_features), labels
+        return (
+            MinMaxScaler().fit_transform(raw_features),
+            labels if include_target else None,
+        )
 
     try:
         loader = DATASET_LOADERS[dataset_name]
@@ -87,7 +95,7 @@ def load_benchmark_data(
 
     dataset: Any = loader()
     features = MinMaxScaler().fit_transform(dataset.data)
-    return features, np.asarray(dataset.target)
+    return features, np.asarray(dataset.target) if include_target else None
 
 
 def _load_csv_from_url(
@@ -95,7 +103,9 @@ def _load_csv_from_url(
     *,
     target_column: str | None = None,
     has_header: bool | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    include_target: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    url = _normalize_github_url(url)
     parsed_url = urlparse(url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
         raise ValueError("Dataset URL must be an absolute HTTP or HTTPS URL")
@@ -118,7 +128,13 @@ def _load_csv_from_url(
     column_count = len(rows[0])
     if any(len(row) != column_count for row in rows):
         raise ValueError("Dataset rows must all contain the same number of columns")
-    label_index = _resolve_target_column(target_column, rows[0], column_count)
+    if not include_target and target_column is not None:
+        raise ValueError("target_column cannot be used when include_target is False")
+    label_index = (
+        _resolve_target_column(target_column, rows[0], column_count)
+        if include_target
+        else None
+    )
 
     if has_header is None:
         has_header = any(
@@ -138,11 +154,13 @@ def _load_csv_from_url(
         raise ValueError("CSV does not contain any data rows")
     if len(rows) < 2:
         raise ValueError("CSV must contain at least two data rows")
-    labels = [row[label_index].strip() for row in rows]
-    if any(not label or _is_missing(label) for label in labels):
-        raise ValueError("Target column contains missing labels")
-    if len(set(labels)) < 2:
-        raise ValueError("Target column must contain at least two distinct labels")
+    labels = None
+    if label_index is not None:
+        labels = [row[label_index].strip() for row in rows]
+        if any(not label or _is_missing(label) for label in labels):
+            raise ValueError("Target column contains missing labels")
+        if len(set(labels)) < 2:
+            raise ValueError("Target column must contain at least two distinct labels")
 
     feature_indices = [
         index
@@ -213,7 +231,24 @@ def _load_csv_from_url(
     features = ColumnTransformer(transformers, remainder="drop").fit_transform(
         raw_features
     )
-    return MinMaxScaler().fit_transform(features), np.asarray(labels)
+    return (
+        MinMaxScaler().fit_transform(features),
+        np.asarray(labels) if labels is not None else None,
+    )
+
+
+def _normalize_github_url(url: str) -> str:
+    parsed_url = urlparse(url)
+    if parsed_url.netloc.casefold() != "github.com":
+        return url
+
+    path_parts = parsed_url.path.strip("/").split("/")
+    if len(path_parts) < 5 or path_parts[2] != "blob":
+        return url
+
+    owner, repository, _, branch, *file_path = path_parts
+    raw_path = "/".join((owner, repository, branch, *file_path))
+    return f"https://raw.githubusercontent.com/{raw_path}"
 
 
 _MISSING_VALUES = {"", "?", "na", "n/a", "null", "none", "nan"}

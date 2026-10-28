@@ -7,13 +7,24 @@ import pytest
 
 import benchmark_data
 import model.evaluate_classic_kmeans as evaluate_classic_kmeans
+import model.evaluate_mw_kmeans as evaluate_mw_kmeans
 import evaluate_all_models as evaluate_all_models
 import model.mw_kmeans as mw_kmeans
 import model.evaluate_dca as evaluate_dca
+import model.evaluate_gk_rdca as evaluate_gk_rdca
 from benchmark_data import expand_dataset_selection
 from model.evaluate_classic_kmeans import evaluate_dataset as evaluate_classic_dataset
 from model.evaluate_dca import evaluate_dataset as evaluate_dca_dataset
-from model.evaluate_mw_kmeans import RESULTS_DIR, evaluate_dataset, save_csv, save_plot
+from model.dca import ip_dca
+from model.evaluate_mw_kmeans import (
+    RESULTS_DIR,
+    evaluate_dataset,
+    resolve_cluster_count,
+    save_csv,
+    save_plot,
+    score_axis_limits,
+    score_clustering,
+)
 from model.mw_kmeans import MWKMeans
 
 
@@ -171,6 +182,43 @@ def test_mw_kmeans_rejects_non_positive_n_init():
         MWKMeans(n_clusters=2, n_init=0)
 
 
+def test_dca_multiple_initializations_are_reproducible_and_select_best_objective():
+    rng = np.random.default_rng(12)
+    X = np.vstack(
+        [
+            rng.normal(loc=[0.0, 0.0], scale=0.25, size=(30, 2)),
+            rng.normal(loc=[4.0, 4.0], scale=0.25, size=(30, 2)),
+            rng.normal(loc=[0.0, 4.0], scale=0.25, size=(30, 2)),
+        ]
+    )
+    single_result = ip_dca(X, n_clusters=3, max_iter=100, n_init=1)
+    multi_result = ip_dca(
+        X,
+        n_clusters=3,
+        max_iter=100,
+        random_state=21,
+        n_init=5,
+    )
+    repeated_result = ip_dca(
+        X,
+        n_clusters=3,
+        max_iter=100,
+        random_state=21,
+        n_init=5,
+    )
+
+    assert multi_result["penalized_objective"] <= single_result["penalized_objective"]
+    assert multi_result["penalized_objective"] == pytest.approx(
+        repeated_result["penalized_objective"]
+    )
+    np.testing.assert_array_equal(multi_result["labels"], repeated_result["labels"])
+
+
+def test_dca_rejects_non_positive_n_init():
+    with pytest.raises(ValueError, match="n_init must be positive"):
+        ip_dca(np.array([[0.0], [1.0]]), n_clusters=2, n_init=0)
+
+
 def test_mw_kmeans_predict_uses_trained_centers():
     X = np.array([
         [0.0, 0.0],
@@ -202,14 +250,13 @@ def test_evaluate_iris_and_wine_returns_complete_dataset_metrics():
         assert result["features"] == feature_count
         assert result["noise_points"] == 0
         for metric in (
+            "silhouette_score",
             "accuracy_percent",
             "precision_macro_percent",
             "recall_macro_percent",
             "f1_macro_percent",
         ):
             assert 0 <= result[metric] <= 100
-        assert -1 <= result["ari"] <= 1
-        assert 0 <= result["nmi"] <= 1
         assert result["runtime_seconds"] >= 0
         assert result["iterations"] > 0
 
@@ -219,6 +266,19 @@ def test_both_iris_evaluators_use_all_features():
     classic_result = evaluate_classic_dataset("iris")
 
     assert mw_result["features"] == classic_result["features"] == 4
+
+
+def test_gk_rdca_evaluator_reports_silhouette_score():
+    result = evaluate_gk_rdca.evaluate_dataset(
+        "iris",
+        n_init=1,
+        max_iter=10,
+    )
+
+    assert result["samples"] == 150
+    assert result["features"] == 4
+    assert -1 <= result["silhouette_score"] <= 1
+    assert result["objective_value"] >= 0
 
 
 def test_evaluate_dataset_rejects_unknown_dataset():
@@ -275,6 +335,127 @@ def test_load_csv_dataset_from_url(monkeypatch):
     assert calls == [("https://example.com/data.csv", 30)]
     np.testing.assert_allclose(features, [[0, 0], [0.5, 0.5], [1, 1]])
     np.testing.assert_array_equal(labels, ["alpha", "beta", "alpha"])
+
+
+def test_github_blob_csv_url_is_converted_to_raw_download(monkeypatch):
+    response = BytesIO(b"feature_a,feature_b,class\n0,10,alpha\n5,20,beta\n")
+    calls = []
+
+    def fake_urlopen(url, timeout):
+        calls.append((url, timeout))
+        return response
+
+    monkeypatch.setattr(benchmark_data, "urlopen", fake_urlopen)
+    features, labels = benchmark_data.load_benchmark_data(
+        url=(
+            "https://github.com/dphi-official/Datasets/blob/master/"
+            "titanic_data.csv"
+        )
+    )
+
+    assert calls == [
+        (
+            "https://raw.githubusercontent.com/dphi-official/Datasets/"
+            "master/titanic_data.csv",
+            30,
+        )
+    ]
+    assert features.shape == (2, 2)
+    np.testing.assert_array_equal(labels, ["alpha", "beta"])
+
+
+def test_load_csv_without_target_uses_all_feature_columns(monkeypatch):
+    response = BytesIO(b"feature_a,feature_b\n0,10\n5,20\n10,30\n")
+    monkeypatch.setattr(benchmark_data, "urlopen", lambda url, timeout: response)
+
+    features, labels = benchmark_data.load_benchmark_data(
+        url="https://example.com/unlabeled.csv",
+        include_target=False,
+    )
+
+    assert features.shape == (3, 2)
+    assert labels is None
+    np.testing.assert_allclose(features, [[0, 0], [0.5, 0.5], [1, 1]])
+
+
+def test_silhouette_is_available_without_ground_truth_labels():
+    features = np.array([[0.0], [0.1], [0.9], [1.0]])
+    result = score_clustering(
+        "unlabeled",
+        None,
+        np.array([0, 0, 1, 1]),
+        features=features,
+        n_features=1,
+        n_clusters=2,
+        runtime_seconds=0.1,
+        iterations=3,
+    )
+
+    assert result["silhouette_score"] > 0.85
+    assert result["accuracy_percent"] is None
+    assert resolve_cluster_count(None, 2) == 2
+    with pytest.raises(ValueError, match="n_clusters must be provided"):
+        resolve_cluster_count(None, None)
+
+
+def test_score_clustering_keeps_degenerate_cluster_result_with_no_silhouette():
+    features = np.array([[0.0], [0.2], [0.7], [1.0]])
+    result = score_clustering(
+        "unlabeled",
+        None,
+        np.array([0, 0, 0, 0]),
+        features=features,
+        n_features=1,
+        n_clusters=3,
+        runtime_seconds=0.1,
+        iterations=5,
+    )
+
+    assert result["clusters"] == 1
+    assert result["silhouette_score"] is None
+
+
+def test_large_dataset_silhouette_uses_reproducible_sample(monkeypatch):
+    features = np.zeros((2001, 2))
+    labels = np.tile([0, 1], 1001)[:2001]
+    calls = []
+
+    def fake_silhouette_score(X, predicted, *, sample_size, random_state):
+        calls.append((X.shape, predicted.shape, sample_size, random_state))
+        return 0.25
+
+    monkeypatch.setattr(
+        evaluate_mw_kmeans,
+        "silhouette_score",
+        fake_silhouette_score,
+    )
+    result = score_clustering(
+        "large",
+        None,
+        labels,
+        features=features,
+        n_features=2,
+        n_clusters=2,
+        runtime_seconds=0.1,
+        iterations=5,
+    )
+
+    assert calls == [((2001, 2), (2001,), 2000, 42)]
+    assert result["silhouette_score"] == 0.25
+
+
+def test_score_chart_limits_start_at_zero_for_non_negative_scores():
+    assert score_axis_limits(np.array([[48.0, 72.0], [91.0, 63.0]])) == (
+        0.0,
+        105.0,
+    )
+
+
+def test_score_chart_limits_include_negative_silhouette_scores():
+    lower, upper = score_axis_limits(np.array([[-20.0, 70.0], [40.0, 95.0]]))
+
+    assert lower < -20.0
+    assert upper == 105.0
 
 
 def test_load_csv_preprocesses_categorical_missing_and_identifier_columns(monkeypatch):
@@ -360,6 +541,7 @@ def test_dca_evaluates_dataset_with_ground_truth_cluster_count(monkeypatch):
         "max_iter": 1000,
         "tol": 1e-6,
         "random_state": 42,
+        "n_init": 10,
     }
     assert result["dataset"] == "custom"
     assert result["samples"] == 4
@@ -402,8 +584,6 @@ def test_classic_kmeans_evaluates_all_shared_datasets():
         assert result["clusters"] == cluster_count
         assert result["noise_points"] == 0
         assert 0 <= result["accuracy_percent"] <= 100
-        assert -1 <= result["ari"] <= 1
-        assert 0 <= result["nmi"] <= 1
         assert result["runtime_seconds"] >= 0
         assert result["iterations"] > 0
 
@@ -462,15 +642,14 @@ def test_combined_evaluator_runs_all_models_on_one_loaded_dataset(monkeypatch):
 
     def fake_load(dataset_name, **kwargs):
         load_calls.append((dataset_name, kwargs))
+        if kwargs.get("include_target") is False:
+            return features, None
         return features, labels
 
     class FakeMWKMeans:
         def __init__(self, **kwargs):
             model_calls.append(("MW-K-means", kwargs))
             self.n_iter_ = 4
-
-        def fit(self, X):
-            return self
 
         def fit_predict(self, X):
             return np.array([0, 0, 1, 1])
@@ -487,10 +666,19 @@ def test_combined_evaluator_runs_all_models_on_one_loaded_dataset(monkeypatch):
         model_calls.append(("DCA", kwargs))
         return {"labels": np.array([0, 0, 1, 1]), "iterations": 5}
 
+    class FakeGKRDCA:
+        def __init__(self, **kwargs):
+            model_calls.append(("GK-RDCA", kwargs))
+            self.n_iter_ = 6
+
+        def fit_predict(self, X):
+            return np.array([0, 0, 1, 1])
+
     monkeypatch.setattr(evaluate_all_models, "load_benchmark_data", fake_load)
     monkeypatch.setattr(evaluate_all_models, "MWKMeans", FakeMWKMeans)
     monkeypatch.setattr(evaluate_all_models, "kmeans", fake_kmeans)
     monkeypatch.setattr(evaluate_all_models, "ip_dca", fake_ip_dca)
+    monkeypatch.setattr(evaluate_all_models, "GKRDCA", FakeGKRDCA)
 
     results = evaluate_all_models.evaluate_dataset(
         "custom",
@@ -504,9 +692,23 @@ def test_combined_evaluator_runs_all_models_on_one_loaded_dataset(monkeypatch):
         "MW-K-means",
         "K-means",
         "DCA",
+        "GK-RDCA",
     ]
     assert all(result["samples"] == 4 for result in results)
-    assert [result["iterations"] for result in results] == [4, 3, 5]
+    assert [result["iterations"] for result in results] == [4, 3, 5, 6]
+    dca_call = next(call for call in model_calls if call[0] == "DCA")
+    assert dca_call[1]["n_init"] == 1
+
+    unlabeled_results = evaluate_all_models.evaluate_dataset(
+        "custom",
+        dataset_url="https://example.com/data.csv",
+        include_target=False,
+        n_clusters=2,
+        n_init=1,
+    )
+    assert len(unlabeled_results) == 4
+    assert all(row["silhouette_score"] > 0.85 for row in unlabeled_results)
+    assert all(row["accuracy_percent"] is None for row in unlabeled_results)
 
 
 def test_combined_csv_contains_all_models_in_one_file(tmp_path):
@@ -524,7 +726,7 @@ def test_combined_csv_contains_all_models_in_one_file(tmp_path):
                 for field in evaluate_all_models.METRIC_FIELDS
             },
         }
-        for model in ("MW-K-means", "K-means", "DCA")
+        for model in ("MW-K-means", "K-means", "DCA", "GK-RDCA")
     ]
     output_path = tmp_path / "results" / "all_models.csv"
 
@@ -538,7 +740,37 @@ def test_combined_csv_contains_all_models_in_one_file(tmp_path):
         "MW-K-means",
         "K-means",
         "DCA",
+        "GK-RDCA",
     ]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["bank_results", "bank_results.csv", "bank_results.png"],
+)
+def test_name_resolves_csv_and_png_paths_from_same_base(name):
+    csv_path, plot_path = evaluate_all_models.resolve_output_paths(
+        name,
+        output=None,
+        plot=None,
+    )
+
+    assert csv_path == RESULTS_DIR / "bank_results.csv"
+    assert plot_path == RESULTS_DIR / "bank_results.png"
+
+
+def test_explicit_combined_output_paths_override_name_paths(tmp_path):
+    csv_override = tmp_path / "custom.csv"
+    png_override = tmp_path / "custom.png"
+
+    csv_path, plot_path = evaluate_all_models.resolve_output_paths(
+        "bank_results",
+        output=csv_override,
+        plot=png_override,
+    )
+
+    assert csv_path == csv_override
+    assert plot_path == png_override
 
 
 def test_combined_plot_exports_png_without_ari_or_nmi(tmp_path):
@@ -547,16 +779,36 @@ def test_combined_plot_exports_png_without_ari_or_nmi(tmp_path):
             "model": model,
             "dataset": "iris",
             "accuracy_percent": 80.0,
+            "silhouette_score": 0.75,
             "precision_macro_percent": 79.0,
             "recall_macro_percent": 78.0,
             "f1_macro_percent": 77.0,
             "runtime_seconds": 0.01,
         }
-        for model in ("MW-K-means", "K-means", "DCA")
+        for model in ("MW-K-means", "K-means", "DCA", "GK-RDCA")
     ]
     output_path = tmp_path / "charts" / "combined.png"
 
     evaluate_all_models.save_combined_plot(rows, output_path)
+
+    assert output_path.is_file()
+    assert output_path.stat().st_size > 0
+
+
+def test_combined_plot_handles_unlabeled_metrics(tmp_path):
+    row = {
+        "model": "GK-RDCA",
+        "dataset": "custom",
+        "silhouette_score": 0.6,
+        "accuracy_percent": None,
+        "precision_macro_percent": None,
+        "recall_macro_percent": None,
+        "f1_macro_percent": None,
+        "runtime_seconds": 0.01,
+    }
+    output_path = tmp_path / "charts" / "unlabeled.png"
+
+    evaluate_all_models.save_combined_plot([row], output_path)
 
     assert output_path.is_file()
     assert output_path.stat().st_size > 0
