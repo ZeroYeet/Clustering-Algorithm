@@ -207,11 +207,11 @@ def save_combined_csv(
 
 
 def resolve_output_paths(
-    name: str,
+    name: str | None,
     output: Path | None,
     plot: Path | None,
 ) -> tuple[Path, Path]:
-    base_name = Path(name)
+    base_name = Path(name or "all_models_results")
     if base_name.suffix.casefold() in {".csv", ".png"}:
         base_name = base_name.with_suffix("")
     if not base_name.name:
@@ -345,13 +345,15 @@ def main() -> None:
     parser.add_argument(
         "--name",
         type=str,
-        default="all_models_results",
-        help="Base name for both CSV and PNG files in the results directory.",
+        help=(
+            "Name for a custom dataset in the results and base name for both "
+            "CSV and PNG files."
+        ),
     )
     parser.add_argument(
         "--output",
         type=Path,
-        help="Explicit CSV output path; overrides --name.",
+        help="Explicit CSV output path; overrides the --name-derived path.",
     )
     parser.add_argument(
         "--plot",
@@ -372,7 +374,7 @@ def main() -> None:
         parser.error("--n-clusters is required with --no-target")
 
     if args.dataset_url:
-        dataset_names = ("custom",)
+        dataset_names = (args.name or "custom",)
     else:
         dataset_names = expand_dataset_selection(args.dataset)
     results = [
