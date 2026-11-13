@@ -43,7 +43,19 @@ python evaluate_all_models.py --dataset iris
 ```
 
 To evaluate a tabular CSV hosted at a direct HTTP(S) download URL, provide
-`--dataset-url` (or its alias `--data-url`) instead of `--dataset`.
+`--dataset-url` (or its alias `--data-url`) instead of `--dataset`. To evaluate
+a local CSV, use `--dataset-file`; for example:
+
+```bash
+python evaluate_all_models.py --dataset-file data/my_data.csv --target-column "class"
+python evaluate_all_models.py --dataset-file data/my_data.csv --no-target --n-clusters 3
+```
+
+The local CSV uses the same parsing and preprocessing rules as a URL-provided
+CSV. The target column defaults to the last column unless `--no-target` is used.
+The combined evaluator displays a progress bar as each of its four models
+finishes running.
+
 Target column can be selected by name or zero-based index with `--target-column`.
 Numeric features are median-imputed, categorical features are mode-imputed and
 one-hot encoded, and the resulting features are scaled to `[0, 1]`. Missing

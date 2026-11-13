@@ -11,6 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from threadpoolctl import threadpool_limits
+from tqdm import tqdm
 
 from benchmark_data import (
     DATASET_SELECTIONS,
@@ -40,6 +41,7 @@ def evaluate_dataset(
     dataset_name: str,
     *,
     dataset_url: str | None = None,
+    dataset_file: str | Path | None = None,
     target_column: str | None = None,
     has_header: bool | None = None,
     include_target: bool = True,
@@ -54,10 +56,12 @@ def evaluate_dataset(
     gk_tau: float = 0.1,
     tol: float = 1e-6,
     random_state: int = 42,
+    progress: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate every project clustering model on one loaded dataset."""
     load_options: dict[str, Any] = {
         "url": dataset_url,
+        "file_path": dataset_file,
         "target_column": target_column,
         "has_header": has_header,
     }
@@ -67,6 +71,8 @@ def evaluate_dataset(
     n_clusters = resolve_cluster_count(true_labels, n_clusters)
     results: list[dict[str, Any]] = []
 
+    if progress is not None:
+        progress.set_postfix_str("MW-K-means")
     mw_model = MWKMeans(
         n_clusters=n_clusters,
         beta=beta,
@@ -90,6 +96,9 @@ def evaluate_dataset(
             mw_model.n_iter_,
         )
     )
+    if progress is not None:
+        progress.update()
+        progress.set_postfix_str("K-means")
 
     with threadpool_limits(limits=1):
         start = time.perf_counter()
@@ -118,6 +127,9 @@ def evaluate_dataset(
             best_kmeans["iterations"],
         )
     )
+    if progress is not None:
+        progress.update()
+        progress.set_postfix_str("DCA")
 
     start = time.perf_counter()
     dca_result = ip_dca(
@@ -141,6 +153,9 @@ def evaluate_dataset(
             dca_result["iterations"],
         )
     )
+    if progress is not None:
+        progress.update()
+        progress.set_postfix_str("GK-RDCA")
 
     gk_model = GKRDCA(
         n_clusters=n_clusters,
@@ -165,6 +180,9 @@ def evaluate_dataset(
             gk_model.n_iter_,
         )
     )
+    if progress is not None:
+        progress.update()
+        progress.set_postfix_str("Complete")
     return results
 
 
@@ -313,6 +331,11 @@ def main() -> None:
         dest="dataset_url",
         help="Direct HTTP(S) URL to a tabular CSV dataset.",
     )
+    dataset_group.add_argument(
+        "--dataset-file",
+        type=Path,
+        help="Path to a local tabular CSV dataset, for example data/my_data.csv.",
+    )
     parser.add_argument(
         "--target-column",
         help="Target column name or zero-based index (default: last column).",
@@ -364,10 +387,13 @@ def main() -> None:
 
     if args.n_init <= 0:
         parser.error("--n-init must be positive")
-    if not args.dataset_url and (
+    if not (args.dataset_url or args.dataset_file) and (
         args.target_column is not None or args.no_header or args.no_target
     ):
-        parser.error("--target-column, --no-header, and --no-target require --dataset-url")
+        parser.error(
+            "--target-column, --no-header, and --no-target require "
+            "--dataset-url or --dataset-file"
+        )
     if args.no_target and args.target_column is not None:
         parser.error("--target-column cannot be used with --no-target")
     if args.no_target and args.n_clusters is None:
@@ -375,30 +401,39 @@ def main() -> None:
 
     if args.dataset_url:
         dataset_names = (args.name or "custom",)
+    elif args.dataset_file:
+        dataset_names = (args.name or args.dataset_file.stem,)
     else:
         dataset_names = expand_dataset_selection(args.dataset)
-    results = [
-        row
-        for dataset_name in dataset_names
-        for row in evaluate_dataset(
-            dataset_name,
-            dataset_url=args.dataset_url,
-            target_column=args.target_column,
-            has_header=False if args.no_header else None,
-            include_target=not args.no_target,
-            n_clusters=args.n_clusters,
-            beta=args.beta,
-            theta=args.theta,
-            n_init=args.n_init,
-            max_iter=args.max_iter,
-            dca_t=args.dca_t,
-            dca_max_iter=args.dca_max_iter,
-            gk_sigma=args.gk_sigma,
-            gk_tau=args.gk_tau,
-            tol=args.tol,
-            random_state=args.random_state,
-        )
-    ]
+    with tqdm(
+        total=4 * len(dataset_names),
+        desc="Evaluating models",
+        unit="model",
+    ) as progress:
+        results = [
+            row
+            for dataset_name in dataset_names
+            for row in evaluate_dataset(
+                dataset_name,
+                dataset_url=args.dataset_url,
+                dataset_file=args.dataset_file,
+                target_column=args.target_column,
+                has_header=False if args.no_header else None,
+                include_target=not args.no_target,
+                n_clusters=args.n_clusters,
+                beta=args.beta,
+                theta=args.theta,
+                n_init=args.n_init,
+                max_iter=args.max_iter,
+                dca_t=args.dca_t,
+                dca_max_iter=args.dca_max_iter,
+                gk_sigma=args.gk_sigma,
+                gk_tau=args.gk_tau,
+                tol=args.tol,
+                random_state=args.random_state,
+                progress=progress,
+            )
+        ]
     try:
         output_path, plot_path = resolve_output_paths(
             args.name,

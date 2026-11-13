@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -44,11 +45,14 @@ def load_benchmark_data(
     dataset_name: str | None = None,
     *,
     url: str | None = None,
+    file_path: str | Path | None = None,
     target_column: str | None = None,
     has_header: bool | None = None,
     include_target: bool = True,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Load a dataset, optionally returning its target labels."""
+    if url is not None and file_path is not None:
+        raise ValueError("Provide either a dataset URL or a local CSV file, not both")
     if url is not None:
         return _load_csv_from_url(
             url,
@@ -56,13 +60,27 @@ def load_benchmark_data(
             has_header=has_header,
             include_target=include_target,
         )
+    if file_path is not None:
+        local_file = Path(file_path)
+        content = local_file.read_text(encoding="utf-8-sig")
+        return _parse_csv_content(
+            content,
+            source_name=f"Dataset file {str(local_file)!r}",
+            target_column=target_column,
+            has_header=has_header,
+            include_target=include_target,
+        )
     if target_column is not None or has_header is not None or not include_target:
         if target_column is not None or has_header is not None:
-            raise ValueError("CSV column options can only be used with a dataset URL")
+            raise ValueError(
+                "CSV column options can only be used with a dataset URL or local file"
+            )
         if not include_target:
-            raise ValueError("--no-target can only be used with a dataset URL")
+            raise ValueError(
+                "--no-target can only be used with a dataset URL or local file"
+            )
     if dataset_name is None:
-        raise ValueError("Provide either a dataset name or a CSV URL")
+        raise ValueError("Provide either a dataset name, CSV URL, or local CSV file")
 
     if dataset_name == "yeast":
         dataset = fetch_openml(
@@ -113,6 +131,23 @@ def _load_csv_from_url(
     with urlopen(url, timeout=30) as response:
         content = response.read().decode("utf-8-sig")
 
+    return _parse_csv_content(
+        content,
+        source_name="Downloaded file",
+        target_column=target_column,
+        has_header=has_header,
+        include_target=include_target,
+    )
+
+
+def _parse_csv_content(
+    content: str,
+    *,
+    source_name: str,
+    target_column: str | None,
+    has_header: bool | None,
+    include_target: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
     try:
         dialect = csv.Sniffer().sniff(content[:8192], delimiters=",;\t|")
     except csv.Error:
@@ -123,7 +158,7 @@ def _load_csv_from_url(
         if any(value.strip() for value in row)
     ]
     if not rows or len(rows[0]) < 2:
-        raise ValueError("Downloaded file is not a supported tabular dataset")
+        raise ValueError(f"{source_name} is not a supported tabular dataset")
 
     column_count = len(rows[0])
     if any(len(row) != column_count for row in rows):
