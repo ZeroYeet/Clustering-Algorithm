@@ -117,14 +117,43 @@ path individually. Missing output directories are created automatically.
   `remove_noise=False` so every point is included in the evaluation
 - MW-K-means computes the mean pairwise distance in triangular chunks and
   updates nearest-center distances incrementally; density estimation remains
-  quadratic in the number of samples
+  quadratic in the number of samples; this implementation is based on [3]
 - Multiple initializations choose using clustering inertia only, without
   consulting dataset labels; better inertia does not guarantee higher
   Silhouette or accuracy on every dataset
 - IP-DCA uses k-means++ center initialization and can run multiple restarts;
   it retains the run with the lowest DCA penalized objective, without consulting
-  ground-truth labels. Set the restart count with `--n-init`.
+  ground-truth labels. Set the restart count with `--n-init`. The MSSC DCA
+  formulation and its later efficient variants are described in [1] and [2].
+- GK-RDCA implements the Gaussian-kernel DCA approach described in [2]
 - Classic K-means uses the project's implementation in `kmeans.py` and runs
   10 random initializations by default, selecting the result with lowest inertia
 
-Yeast source: [OpenML dataset 181](https://www.openml.org/d/181).
+## Dataset sources
+
+The built-in benchmarks are loaded through scikit-learn, except Yeast, which is
+fetched from OpenML:
+
+- Iris: [UCI Machine Learning Repository, dataset 53](https://archive.ics.uci.edu/dataset/53/iris)
+- Wine: [UCI Machine Learning Repository, dataset 109](https://archive.ics.uci.edu/dataset/109/wine)
+- Breast Cancer Wisconsin (Diagnostic): [UCI Machine Learning Repository, dataset 17](https://archive.ics.uci.edu/dataset/17/breast+cancer+wisconsin+diagnostic)
+- Yeast: [OpenML dataset 181](https://www.openml.org/d/181)
+
+The local `bankVN80k` dataset is intentionally excluded from external source
+citations.
+
+## References
+
+1. Le Thi Hoai An and Pham Dinh Tao. "Minimum Sum-of-Squares Clustering by DC
+   Programming and DCA." In *Emerging Intelligent Computing Technology and
+   Applications: With Aspects of Artificial Intelligence*, Lecture Notes in
+   Artificial Intelligence, vol. 5755, pp. 327-340.
+   Springer, 2009. [https://doi.org/10.1007/978-3-642-04020-7_35](https://doi.org/10.1007/978-3-642-04020-7_35)
+2. Le Thi Hoai An, Le Hoai Minh, and Pham Dinh Tao. "New and efficient DCA
+   based algorithms for minimum sum-of-squares clustering.” *Pattern
+   Recognition*, 47(1), pp. 388-401, 2014.
+   [https://doi.org/10.1016/j.patcog.2013.07.012](https://doi.org/10.1016/j.patcog.2013.07.012)
+3. YanPing Zhao and XiaoLai Zhou. "K-means Clustering Algorithm and Its
+   Improvement Research." *Journal of Physics: Conference Series*, 1873(1),
+   012074, 2021.
+   [https://doi.org/10.1088/1742-6596/1873/1/012074](https://doi.org/10.1088/1742-6596/1873/1/012074)
