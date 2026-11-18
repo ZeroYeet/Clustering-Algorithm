@@ -113,8 +113,8 @@ def _ip_dca_single(
     memberships         : (c, n) ma trận thành viên U (xấp xỉ 0/1).
     centers             : (c, d) tâm cụm V.
     rho                 : giá trị rho cuối cùng.
-    radius              : bán kính r của hình cầu chứa tâm cụm.
-    iterations          : len(history).
+    radius              : bán kính r dùng trong phép chiếu ở tọa độ đã căn giữa.
+    iterations          : số bước DCA đã thực hiện.
     objective_history   : giá trị F1 qua các vòng lặp.
     mssc                : F(U, V).
     penalty             : p(U).
@@ -172,7 +172,7 @@ def ip_dca(
     random_state=42,
     n_init=10,
 ):
-    """Run DCA from multiple k-means++ starts and retain the best objective."""
+    """Run DCA on centered data and return centers in the original coordinates."""
     if not isinstance(n_init, (int, np.integer)) or n_init <= 0:
         raise ValueError("n_init must be positive")
     if not isinstance(max_iter, (int, np.integer)) or max_iter <= 0:
@@ -201,16 +201,21 @@ def ip_dca(
     else:
         initial_centers = None
 
+    data_offset = data.mean(axis=0)
+    centered_data = data - data_offset
+    if initial_centers is not None:
+        initial_centers = initial_centers - data_offset
+
     rng = np.random.default_rng(random_state)
     best_result = None
     for init_index in range(n_init):
         centers = (
             initial_centers
             if init_index == 0 and initial_centers is not None
-            else _kmeans_plus_plus_init(data, n_clusters, rng)
+            else _kmeans_plus_plus_init(centered_data, n_clusters, rng)
         )
         result = _ip_dca_single(
-            data,
+            centered_data,
             n_clusters,
             c_init=centers,
             t=t,
@@ -227,4 +232,5 @@ def ip_dca(
 
     if best_result is None:
         raise RuntimeError("DCA failed to produce a clustering solution")
+    best_result["centers"] = best_result["centers"] + data_offset
     return best_result

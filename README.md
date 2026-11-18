@@ -125,6 +125,8 @@ path individually. Missing output directories are created automatically.
   it retains the run with the lowest DCA penalized objective, without consulting
   ground-truth labels. Set the restart count with `--n-init`. The MSSC DCA
   formulation and its later efficient variants are described in [1] and [2].
+  DCA centers the features internally to reduce its theoretical `rho` bound
+  and returns cluster centers in the original feature coordinates.
 - GK-RDCA implements the Gaussian-kernel DCA approach described in [2]
 - Classic K-means uses the project's implementation in `kmeans.py` and runs
   10 random initializations by default, selecting the result with lowest inertia
